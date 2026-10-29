@@ -38,6 +38,8 @@ MXCはDockerのようなコンテナ管理ツールというよりも、**アプ
 
 GitHub Copilot CLIのローカルサンドボックスも、このMXCを利用しています。
 
+![GitHub Copilot CLIや自作AIエージェントから、MXC SDKとセキュリティポリシー、OSごとの分離バックエンドを経て、制限されたコマンドを実行する流れ](image/mxc-sandbox-execution-flow.svg)
+
 ### GitHub Copilot CLIとの関係
 
 Copilot CLIは、実行するコマンドやアクセスできるディレクトリ、ネットワークなどについてポリシーを構成し、MXCがOSに応じた隔離機構を使用してその制限を適用します。
@@ -62,15 +64,14 @@ Copilot CLIは、実行するコマンドやアクセスできるディレクト
 | 項目 | 環境 |
 |---|---|
 | OS | Windows 11 26H2 |
-| 更新前のビルド | 26300.9457 |
-| 更新後のビルド | 26300.9711 |
+| ビルド | 26300.9711 |
 | Node.js | v24.20.0（検証時） |
 | MXC | `@microsoft/mxc-sdk` |
 | MXC分離バックエンド | ProcessContainer |
 | 隔離レベル | base-container |
 | GitHub Copilot CLI | 1.0.103（ポリシー表示から確認） |
 
-Windows側の隔離機能は、OSのバージョンや更新状況によって利用できるものが異なります。
+Windows側の隔離機能は、OSのバージョンや更新状況によって利用できるものが異なります。利用する機能のOS要件を満たしていない場合は動作しないため、事前に[公式のOSバージョン要件](https://github.com/microsoft/mxc/blob/main/docs/backends/process-container/os-version-support.md)を確認してください。
 
 今回も、Windows Updateの前後でネットワーク関連の動作に違いが見られました。
 
@@ -142,9 +143,37 @@ warnings: []
 
 正常に実行できました。
 
-`run()` に渡す `command` がサンドボックス内で実行するコマンドです。`containment` で分離方式を指定し、`timeoutMs` で実行時間を制限しています。
+### コードの仕組みを理解する
 
-通常の `child_process` によるコマンド起動と異なり、MXCではファイルシステムやネットワークなどのアクセス制限も指定できます。
+`run()` は、指定したコマンドをサンドボックス内で実行するSDKの関数です。`import` でこの関数を読み込み、引数のオブジェクトに実行するコマンドや分離方式をまとめて渡しています。`await` は非同期の実行が完了するまで待ち、その結果を `result` に代入するために使います。
+
+この例で `run()` に渡している設定は、次の3つです。
+
+| パラメータ | 意味 | この例での指定 |
+|---|---|---|
+| `command` | サンドボックス内で実行するコマンド | `cmd.exe` を起動し、`echo` で `Hello from MXC` を出力する |
+| `containment` | コマンドを分離する方式（分離バックエンド） | `{ type: 'process' }` でプロセス分離を選択する |
+| `timeoutMs` | コマンドの最大実行時間。単位はミリ秒 | `30000`、つまり30秒を指定する |
+
+`command` の中にある `echo` は、Windowsのコマンドプロンプトが解釈するコマンドです。そのため、この例では `cmd.exe` を明示的に起動しています。`/d` はコマンドプロンプトのAutoRun設定を無効にし、`/s` は `/c` に続く文字列の引用符の扱いを指定します。`/c` は、後ろに続く `echo Hello from MXC` を実行して終了する指定です。
+
+実行後の `result` には、コマンドの出力や終了状態が入ります。後半の `console.log()` は、それぞれの値をNode.js側のコンソールに表示しています。
+
+| プロパティ | 意味 | 今回の結果の読み方 |
+|---|---|---|
+| `result.stdout` | 標準出力。コマンドが通常の実行結果を出力する先 | `echo` が出力した `Hello from MXC` が入る |
+| `result.stderr` | 標準エラー出力。エラーメッセージなどを出力する先 | 今回は空で、標準エラーへの出力はない |
+| `result.exitCode` | コマンドの終了コード。通常は `0` が成功、`0` 以外が失敗を表す | `0` なので、コマンドは正常に終了した |
+| `result.timedOut` | 実行が時間制限に達したかどうか | `false` なので、30秒の時間制限には達していない |
+| `result.warnings` | MXCが返す、分離設定などに関する警告の配列 | `[]` は空の配列で、警告は返されていない |
+
+標準エラーは出力先の名前であり、そこに文字列があるだけで実行失敗と判断できるわけではありません。結果を確認するときは、終了コードやタイムアウトの有無と併せて読みます。また、`warnings: []` はMXCからの警告がないことを示しますが、ファイルやネットワークへのアクセス制限が期待どおりに働くことまで検証した結果ではありません。
+
+Node.jsの `child_process.exec()` は、シェル経由でコマンドを起動し、その出力などを取得するためのAPIです。MXCの `run()` では、コマンドの実行にセキュリティポリシーとOS固有の分離機構を適用できます。例えば、ファイルを読み取り専用にしたり、ネットワークアクセスを拒否したりする設定を、実行時のオプションとして指定できます。
+
+この最小サンプルでは、`filesystem` や `network` のポリシーは明示的に指定していません。ここで確認したのは、選択した分離方式でコマンドを実行し、出力と終了状態を取得できることです。続く節では、アクセス制限を明示的に設定し、許可した操作と拒否した操作の結果を比較します。
+
+参考：[MXC公式の最小実行サンプル（Node.js）](https://github.com/microsoft/mxc/tree/main/samples/run-in-transient-container/node)
 
 ## 5. ネットワーク制御を試す
 
@@ -231,11 +260,7 @@ try {
 
 ここでは、通信を許可する場合と拒否する場合の2回、同じHTTPサーバーにアクセスします。
 
-### 5.2 補足：Windowsのビルド要件
-
-今回のネットワーク制御を試すには、Windowsのビルド26300.9711以降が必要です。それ以前のビルドでは、ホストのループバック通信の許可などが期待どおりに動作しないため、Windowsを更新してから実行してください。
-
-### 5.3 ネットワーク制御の検証結果
+### 5.2 ネットワーク制御の検証結果
 
 通信を許可する場合と拒否する場合で、次の結果が得られました。
 
@@ -258,9 +283,16 @@ warnings: []
 | Allow | HTTPアクセス成功 |
 | Deny | 接続失敗 |
 
-この比較により、**MXCのネットワークポリシーによって、ホストのループバック通信を許可・拒否できること**を確認しました。
+今回確認したのは、サンドボックス内の `curl.exe` から、ホスト側の `127.0.0.1` で待ち受けるHTTPサーバーへの接続です。`egress.default`、`ingress.default`、`ingress.hostLoopback` をすべて `allow` にすると応答を取得でき、すべて `deny` にすると接続に失敗しました。
 
-ただし、検証できたのはこの通信経路についてであり、すべてのネットワークアクセスに対する制御の完全性を確認したわけではありません。
+一方、次の項目はこのプログラムでは検証していません。
+
+- 外部インターネットや、同じLAN上の別の端末への接続
+- DNSによる名前解決や、UDP・IPv6を使った通信
+- ホストや別の端末から、サンドボックス内で待ち受けるサーバーへの接続
+- `egress.default`、`ingress.default`、`ingress.hostLoopback` を一つずつ変更した場合の動作
+
+3つの設定を同時に切り替えているため、今回の接続失敗がどの設定によって生じたかは、この結果だけでは切り分けられません。
 
 参考：[MXC Windows OS-version support](https://github.com/microsoft/mxc/blob/main/docs/backends/process-container/os-version-support.md)
 
@@ -277,6 +309,10 @@ MXCでは、主に以下の3種類を指定できます。
 | `deniedPaths` | アクセスを拒否 |
 
 ### 6.1 読み取り専用ポリシー
+
+まずは、読み取り専用フォルダに対して、読み取りは成功し、書き込みは失敗することを検証します。
+
+![MXCの読み取り専用ポリシーにより、cmd.exeからのファイルの読み取りは成功し、書き込みは拒否される](image/mxc-readonly-policy.svg)
 
 テスト用ディレクトリを作成します。
 
@@ -356,6 +392,7 @@ blocked.txt exists: false
 読み取りは成功しましたが、書き込みは拒否されました。
 
 ホスト側にファイルが作成されていないことも確認できたため、`readonlyPaths` の動作を確認できました。
+
 
 ### 6.2 読み書き許可ポリシー
 
@@ -452,11 +489,39 @@ Copilot CLIでは、MXC SDKのプログラムを自分で作成しなくても�
 
 ### 7.1 サンドボックスの有効化
 
-作業ディレクトリを作成してCopilot CLIを起動します。
+以下のパスでは、ユーザー名を `<ユーザー名>` に置き換えています。コマンドを実行する際は、実際のユーザー名に置き換えてください。
+
+まず、MXC単体の検証で使用した作業フォルダとは別に、Copilot CLIの作業ディレクトリ `copilot-test` と、アクセス制御のテスト用ディレクトリ `copilot-protected` を作成します。PowerShellで次のコマンドを実行します。
 
 ```powershell
-mkdir copilot-test
-cd copilot-test
+cd "C:\Users\<ユーザー名>\Project\mxc-tutorial"
+
+New-Item -ItemType Directory -Force "C:\Users\<ユーザー名>\Project\mxc-tutorial\copilot-test"
+New-Item -ItemType Directory -Force "C:\Users\<ユーザー名>\Project\mxc-tutorial\copilot-protected"
+
+Set-Content "C:\Users\<ユーザー名>\Project\mxc-tutorial\copilot-protected\secret.txt" `
+    "SECRET_DATA_FOR_SANDBOX_TEST" -Encoding ascii
+
+Set-Content "C:\Users\<ユーザー名>\Project\mxc-tutorial\copilot-protected\readonly.txt" `
+    "READ_ONLY_TEST" -Encoding ascii
+```
+
+テストにはダミーデータのみを使います。ここまでの検証で作成したスクリプトも含めると、次の構成になります（関連するファイルのみ抜粋）。
+
+```text
+mxc-tutorial/
+├── copilot-test/          ← Copilot CLIの作業ディレクトリ
+├── copilot-protected/     ← アクセス制御のテスト用
+│   ├── secret.txt
+│   └── readonly.txt
+├── filesystem-test.mjs
+└── local-network-test.mjs
+```
+
+続いて、`copilot-test` に移動してCopilot CLIを起動します。
+
+```powershell
+cd "C:\Users\<ユーザー名>\Project\mxc-tutorial\copilot-test"
 copilot
 ```
 
@@ -464,6 +529,11 @@ Copilot CLIで次のコマンドを実行します。
 
 ```text
 /sandbox enable
+```
+
+続いて、次のコマンドでサンドボックスが有効になっていることを確認します。
+
+```text
 /sandbox status
 ```
 
@@ -477,20 +547,108 @@ Current sandbox status: enabled
 
 ### 7.2 実際のポリシーを確認する
 
+Copilot CLI内で次のコマンドを実行し、アクセスが許可されているパスとネットワークの設定を確認します。
+
 ```text
 /sandbox policy
 ```
 
+特に、次の点を確認します。
+
+- `copilot-test` に読み書き権限があるか
+- `copilot-protected` に権限が付与されているか
+- 外向き通信とローカルネットワークへのアクセスが許可されているか
+- 開発ツールや一時ディレクトリのうち、どのパスが自動的に許可されているか
+
 今回の環境では、以下のような設定が表示されました。
 
 ```text
+Effective sandbox policy for C:\Users\<ユーザー名>\Project\mxc-tutorial\copilot-test
+
+System:
+  Read-only paths (45):
+    \\?\C:\Users\<ユーザー名>\AppData\Local\Programs\Jan\resources\bin
+    C:\bin\absl\bin
+    C:\bin\DMTX\bin
+    C:\bin\TensorRT-10.8.0.43\lib
+    C:\bin\VTK\bin
+    C:\bin\ZXing\bin
+    C:\GMD\toolchain\Jre\bin
+    C:\OpenCV\x64\vc17\bin
+    C:\Program Files (x86)\NVIDIA Corporation\PhysX\Common
+    C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit
+    C:\Program Files\CMake\bin
+    C:\Program Files\dotnet
+    C:\Program Files\Git\cmd
+    C:\Program Files\GitHub CLI
+    C:\Program Files\JPKI
+    C:\Program Files\nodejs
+    C:\Program Files\NVIDIA Corporation\Nsight Compute 2026.3.1
+    C:\Program Files\NVIDIA Corporation\NVIDIA app\NvDLISR
+    C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin
+    C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\libnvvp
+    C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin
+    C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin\x64
+    C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin
+    C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64
+    C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4\bin
+    C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4\bin\x64
+    C:\Program Files\NVIDIA\CUDNN\v9.7\bin
+    C:\Program Files\PowerToys\DSCModules
+    C:\Program Files\TortoiseGit\bin
+    C:\Program Files\usbipd-win
+    C:\Program Files\WSL
+    C:\ProgramData\chocolatey\bin
+    C:\TDM-GCC-64\bin
+    C:\texlive\2023\bin\windows
+    C:\tools\dart-sdk\bin
+    C:\Users\<ユーザー名>\.local\bin
+    C:\Users\<ユーザー名>\AppData\Local\GitHubDesktop\bin
+    C:\Users\<ユーザー名>\AppData\Local\Google\Cloud SDK\google-cloud-sdk\bin
+    C:\Users\<ユーザー名>\AppData\Local\Microsoft\WindowsApps
+    C:\Users\<ユーザー名>\AppData\Local\Microsoft\WinGet\Packages\astral-sh.uv_Microsoft.Winget.Source_8wekyb3d8bbwe
+    C:\Users\<ユーザー名>\AppData\Local\Microsoft\WinGet\Packages\GitHub.Copilot_Microsoft.Winget.Source_8wekyb3d8bbwe
+    C:\Users\<ユーザー名>\AppData\Local\Programs\Antigravity\bin
+    C:\Users\<ユーザー名>\AppData\Local\Programs\Microsoft VS Code\bin
+    C:\Users\<ユーザー名>\AppData\Local\Programs\Microsoft VS Code\bin\copilot-shim
+    C:\Users\<ユーザー名>\AppData\Roaming\npm
+  Read-write paths (1):
+    C:\Users\<ユーザー名>\AppData\Local\Temp
+
 Working directory:
   Read-write paths (1):
-    C:\Users\nextr\Project\mxc-tutorial\copilot-test
+    C:\Users\<ユーザー名>\Project\mxc-tutorial\copilot-test
 
 Current session:
   Read-write paths (1):
-    ...\session-state\...\files
+    C:\Users\<ユーザー名>\.copilot\session-state\c9e860e2-0271-4dcc-892f-e3fb8de609cb\files
+
+Copilot home:
+  Read-only paths (1):
+    C:\Users\<ユーザー名>\.copilot\logs
+
+Personal skill roots:
+  Read-only paths (2):
+    C:\Users\<ユーザー名>\.agents\skills
+    C:\Users\<ユーザー名>\AppData\Local\copilot\pkg\win32-x64\1.0.103\builtin
+
+Dev tools:
+  Tools detected in this directory: (none)
+  A command can bring in more: run /sandbox policy <command> to resolve those.
+  Read-only paths (13):
+    C:\Program Files\WindowsPowerShell\Modules
+    C:\Users\<ユーザー名>\AppData\Local\Google\Cloud SDK\google-cloud-sdk\platform\PowerShell
+    C:\Users\<ユーザー名>\AppData\Local\Programs\Antigravity
+    C:\Users\<ユーザー名>\AppData\Local\Programs\Arduino IDE
+    C:\Users\<ユーザー名>\AppData\Local\Programs\balena-etcher
+    C:\Users\<ユーザー名>\AppData\Local\Programs\Common
+    C:\Users\<ユーザー名>\AppData\Local\Programs\Evernote
+    C:\Users\<ユーザー名>\AppData\Local\Programs\GitHub Copilot
+    C:\Users\<ユーザー名>\AppData\Local\Programs\Jan
+    C:\Users\<ユーザー名>\AppData\Local\Programs\Microsoft VS Code
+    C:\Users\<ユーザー名>\AppData\Local\Programs\netron
+    C:\Users\<ユーザー名>\AppData\Local\Programs\Obsidian
+    C:\Users\<ユーザー名>\AppData\Local\Programs\Ollama
 
 Network:
   Outbound: allowed
@@ -500,11 +658,12 @@ Capabilities:
   Allow sandbox bypass: yes
   Sandbox MCP servers: sandboxed
   Sandbox LSP servers: sandboxed
-  Authenticate git: on
-  Authenticate gh: on
+  Authenticate git (sandbox setting): on
+  Authenticate gh (sandbox setting): on
+  Denial capture: off
 ```
 
-実際のポリシーには、このほか多数の開発ツールのインストール先が読み取り専用パスとして登録されていました。
+この出力では、開発ツールのインストール先が読み取り専用パスとして、一時ディレクトリが読み書き可能なパスとして登録されていました。
 
 この結果から、Copilot CLIが単純に作業ディレクトリだけを許可するのではなく、Node.js、Git、Python関連ツールなどの実行環境も考慮してポリシーを構成していることが分かります。
 
@@ -512,15 +671,7 @@ Capabilities:
 
 ## 8. Copilot CLIでファイルシステム制御を試す
 
-今回は、作業ディレクトリとは別に保護用ディレクトリを作成しました。
-
-```text
-mxc-tutorial/
-├── copilot-test/
-└── copilot-protected/
-    ├── readonly.txt
-    └── secret.txt
-```
+7.1節で作成した `copilot-protected` の `readonly.txt` と `secret.txt` に、アクセス制御のポリシーを設定します。
 
 Copilot CLIで次を実行します。
 
@@ -528,35 +679,37 @@ Copilot CLIで次を実行します。
 /sandbox config
 ```
 
-Filesystem設定から、以下のポリシーを追加しました。
+設定画面のFilesystemタブで、User-configured pathsを選択します。Aキーでパスを追加し、絶対パスと権限を指定します。設定後はEscキーで保存して閉じます。
+
+今回は、以下のポリシーを追加しました。作業ディレクトリの読み書き権限は、7.2節の出力で既に確認できています。
 
 | ファイル | 設定 |
 |---|---|
-| `readonly.txt` | Read-only |
-| `secret.txt` | Deny |
+| `C:\Users\<ユーザー名>\Project\mxc-tutorial\copilot-protected\readonly.txt` | Read-only |
+| `C:\Users\<ユーザー名>\Project\mxc-tutorial\copilot-protected\secret.txt` | Deny |
 
 `/sandbox policy` で、次の設定が反映されていることを確認できました。
 
 ```text
 User-configured paths:
   Read-only paths (1):
-    ...\copilot-protected\readonly.txt
+    C:\Users\<ユーザー名>\Project\mxc-tutorial\copilot-protected\readonly.txt
 
   Denied paths (1):
-    ...\copilot-protected\secret.txt
+    C:\Users\<ユーザー名>\Project\mxc-tutorial\copilot-protected\secret.txt
 ```
 
 ### 8.1 読み取り専用テスト
 
 Copilotに次のように指示しました。
 
-> PowerShellのGet-Contentでreadonly.txtを読み取り、その後Add-Contentで追記してください。サンドボックス外での再実行やバイパスはしないでください。
+> PowerShellのシェルコマンドを使い、C:\Users\<ユーザー名>\Project\mxc-tutorial\copilot-protected\readonly.txt を読み取った後、ファイルに MODIFIED と追記してください。両方の終了コードを報告してください。サンドボックス外での再実行やバイパスはしないでください。
 
 結果：
 
-- 読み取りは成功
-- 追記はアクセス拒否
-- ファイル内容は変更されなかった
+- 読み取りは成功し、`READ_ONLY_TEST` が表示された（終了コード0）
+- `Add-Content` による追記はアクセス拒否で失敗したが、報告された終了コードは0だった
+- `MODIFIED` は書き込まれず、ファイル内容は変更されなかった
 
 MXC単体と同じように、読み取り専用ポリシーが機能していることを確認できました。
 
@@ -564,9 +717,22 @@ MXC単体と同じように、読み取り専用ポリシーが機能してい�
 
 ### 8.2 アクセス拒否テストとバイパス機能
 
-次は `secret.txt` を読み取るようにCopilotへ指示しました。
+次は、Copilotへ次のように指示しました。
+
+> PowerShellの Get-Content コマンドを使って、C:\Users\<ユーザー名>\Project\mxc-tutorial\copilot-protected\secret.txt の読み取りを試してください。結果と終了コードを報告してください。サンドボックス外での再実行やバイパスはしないでください。
 
 最初の実行では、Copilotが承認を求め、確認がキャンセルされたため、Shellコマンドは実行されませんでした。
+
+記録には次のメッセージが残っています。
+
+```text
+Shell Attempt reading protected secret file (sandboxed)  Operation aborted by user
+Approval check
+- Confirmation cancelled for shell command (Get-Content, Write-Error)
+Retry keeps the sandbox attached; file and process access is logged instead of blocked.
+```
+
+この時点では、実行時のアクセス拒否を確認できていません。
 
 このとき、サンドボックスの制限を緩和して再実行する選択肢が表示されました。
 
@@ -578,13 +744,38 @@ Allow sandbox bypass: yes
 
 Copilot CLIでは、サンドボックスがアクセスを拒否した場合でも、ユーザーが承認することで制限を緩和したり、バイパスして再実行できる場合があります。
 
-今回はアクセス制御を検証するため、`/sandbox config` から **Allow sandbox bypassを無効**にしました。
+### 8.3 Allow sandbox bypassを無効にしてアクセス拒否を再検証する
+
+承認による制限の緩和を避けてアクセス制御を検証するため、Allow sandbox bypassを無効にして、同じファイルの読み取りを再検証しました。
+
+まず、Copilot CLIで次のコマンドを実行します。
 
 ```text
-Allow sandbox bypass: no
+/sandbox config
 ```
 
-その後、再び `secret.txt` の読み取りを指示した結果です。
+Generalタブの `Allow sandbox bypass` を `Off` に変更します。続いて、次のコマンドで実効ポリシーを確認します。
+
+```text
+/sandbox policy
+```
+
+今回は、次のようにバイパスが無効になっていることを確認しました。
+
+```text
+Capabilities:
+  Allow sandbox bypass: no
+```
+
+その後、Copilotに次の検証プロンプトを入力しました。
+
+> サンドボックスの動作確認を行います。PowerShellの `Get-Content` を使って `C:\Users\<ユーザー名>\Project\mxc-tutorial\copilot-protected\secret.txt` の読み取りを1回だけ試みてください。`-ErrorAction Stop` を指定し、失敗時は例外を捕捉してプロセスを終了コード1で終了させてください。サンドボックスのバイパスや他のツールによる再試行は行わないでください。
+
+`-ErrorAction Stop` と例外処理を指定するのは、8.1節のように、コマンドレットが失敗しても終了コードだけでは判断できない状況を避けるためです。
+
+期待する結果は、ファイル内容が表示されず、アクセス拒否となることです。実行前の安全性チェックや承認段階で中止された場合は、実行時のアクセス拒否とは区別します。
+
+記録では、Shellツールがサンドボックス内で実行され、次の結果が報告されました。
 
 ```text
 Shell (sandboxed)
@@ -595,47 +786,79 @@ Shell (sandboxed)
 再試行やバイパスは行っていません。
 ```
 
-アクセス拒否が確認できました。
+| 確認項目 | 結果 |
+|---|---|
+| サンドボックス | 有効 |
+| Allow sandbox bypass | 無効（`no`） |
+| `C:\Users\<ユーザー名>\Project\mxc-tutorial\copilot-protected\secret.txt` の読み取り | アクセス拒否、内容は取得できず |
+| 終了コード | 1 |
+| 再試行・バイパス | なし |
 
 ここで重要なのは、**Copilot CLIのコマンド実行承認と、MXCによる実行時のアクセス制御は異なる仕組みである**という点です。
 
 今回の最初のテストは承認段階で中止されました。一方、バイパスを無効化した後のテストは、Shellツールが実行され、アクセス拒否で終了しました。
 
-ただし、CLIの実行ログだけでは、個々のアクセス拒否がOS側のどの機構によって発生したかまでは断定できません。
+ただし、CLIの実行ログだけでは、拒否がOS側のMXCによるものか、Copilot CLI側の追加制御によるものかまでは特定できません。
+
+### 8.4 ファイルシステム検証結果のまとめ
+
+| ポリシー | MXC単体 | Copilot CLI |
+|---|---|---|
+| `readwritePaths` | 読み書き成功 | 作業ディレクトリへの権限付与を確認、書き込み操作は未検証 |
+| `readonlyPaths` | 読み取り成功、書き込み拒否 | 読み取り成功、追記拒否 |
+| `deniedPaths` | 読み取り拒否 | バイパス無効化後、読み取り拒否 |
+
+Copilot CLIでは、作業ディレクトリ `C:\Users\<ユーザー名>\Project\mxc-tutorial\copilot-test` にRead-write権限が割り当てられていることを `/sandbox policy` で確認できています。ただし、権限の表示と、実際の書き込み操作の成功は分けて評価しています。
 
 ## 9. Copilot CLIでネットワーク制御を試す
 
 最後に、Copilot CLIのネットワークアクセスを検証しました。
 
+検証では、サンドボックスを有効にし、8.3節で設定した `Allow sandbox bypass: no` を維持しました。Shellツールによるコマンドの実行結果を確認し、Web検索やサンドボックス外での再実行は使わない条件です。
+
 ### 9.1 Outboundを拒否する
 
-`/sandbox config` で外向き通信を拒否し、Shellツールからcurlを実行します。
+`/sandbox config` のNetworkタブで外向き通信を拒否し、Copilotに次のように指示しました。
+
+> ローカルサンドボックスのネットワーク制御を検証します。Shellツールで `curl.exe --noproxy "*" -I --max-time 5 https://example.com` を1回だけ実行してください。終了コードと標準エラー出力を報告してください。Web検索ツールは使わず、サンドボックス外での再実行やバイパスもしないでください。
+
+Shellツールが実行したPowerShellコマンドは次のとおりです。
 
 ```powershell
-curl.exe --noproxy "*" -I --max-time 5 https://example.com
+curl.exe --noproxy "*" -I --max-time 5 https://example.com; Write-Output "EXIT_CODE=$LASTEXITCODE"
 ```
 
 結果：
 
 ```text
 curl: (6) Could not resolve host: example.com
+EXIT_CODE=6
 ```
 
-終了コードは6でした。
-
-サンドボックス内でDNS名前解決に失敗し、外部サイトに接続できませんでした。
+Shellツールは `sandboxed` と表示され、curlは名前解決エラーを返しました。終了コードは6で、HTTP応答は取得できませんでした。ただし、この結果だけでは、名前解決の失敗がサンドボックスの制限によるものか、DNSや接続環境によるものかまでは判断できません。許可時の結果と比較する必要があります。
 
 ### 9.2 Outboundを許可する
 
-次に、ネットワーク設定を以下のように変更しました。
+次に、`/sandbox config` でOutboundを許可し、Local networkは拒否したままにしました。設定変更後はセッションを再起動し、サンドボックスの状態と実効ポリシーを確認する手順で進めます。
+
+```text
+/restart-session
+/sandbox status
+/sandbox policy
+```
+
+比較時に確認したポリシーは次のとおりです。
 
 ```text
 Network:
   Outbound: allowed
   Local network: blocked
+
+Capabilities:
+  Allow sandbox bypass: no
 ```
 
-同じcurlコマンドを実行すると、予想外の結果になりました。
+接続先とオプションを維持し、待ち時間を `--max-time 10` に変更して再検証を依頼したところ、Shellツールは次のエラーを返しました。
 
 ```text
 GenericFailure
@@ -646,22 +869,24 @@ Sandboxed commands cannot reach the loc...
 
 今回はcurlのエラーではなく、**サンドボックス内のコマンド自体が開始できませんでした。**
 
-つまり、通信に失敗したというより、MXCによるコマンド実行の準備段階で問題が発生したことになります。
+エラーはCopilot CLIのサンドボックス付きコマンドの起動処理で発生しています。curlは実行されていないため、curlの終了コード、HTTPステータス、標準エラー出力は取得できません。表示された `GenericFailure` は、curlの終了コード6とは区別して扱います。ログだけでは、起動処理のどの内部コンポーネントが拒否したかまでは特定できません。
 
 ### 9.3 なぜLocal networkが関係するのか
 
 GitHub公式ドキュメントによると、Windows版Copilot CLIでは、ホスト別ネットワークルールやプロキシ機能、認証情報の保護にローカルプロキシが利用されます。
 
-こうした機能を使用する場合、`Allow local network` の設定が必要になります。
+Windowsでこれらのプロキシ機能を使うには、対応するOSに加えて `Allow local network` の有効化が必要です。Gitや `gh` の認証情報のマスキングも、リモートプロキシやホスト別ルールを設定していなくてもローカルプロキシを使います。
 
 今回の環境では、次の機能も有効でした。
 
 ```text
-Authenticate git: on
-Authenticate gh: on
+Authenticate git (sandbox setting): on
+Authenticate gh (sandbox setting): on
 ```
 
 今回の起動エラーは、ローカルネットワークを禁止した状態で、Copilot CLIが必要とするローカルサービスへの接続条件を満たせなかった可能性があります。
+
+そのため、当初の「Outboundだけを許可し、Local networkは拒否のままにする」という案内は、この環境で使われるローカルプロキシの条件を考慮できていませんでした。切り分けとして、次はOutboundを許可したままLocal networkも許可します。この変更はプライベートネットワークへのアクセスも許可するため、ローカルプロキシだけに限定した例外設定ではありません。
 
 ただし、ログが途中で省略されているため、具体的にどのローカルサービスが原因だったかは確定していません。
 
@@ -669,7 +894,7 @@ Authenticate gh: on
 
 ### 9.4 ネットワーク許可時の最終検証
 
-ネットワーク設定を以下のように変更し、サンドボックスのバイパスを無効にした状態で検証しました。
+`/sandbox config` でLocal networkを許可し、セッションを再起動してから、サンドボックスの状態と実効ポリシーを確認します。原稿に記録されている追加検証では、以下の設定でサンドボックスのバイパスを無効にした状態を確認しました。
 
 ```yaml
 Network:
@@ -698,6 +923,20 @@ after 49 ms: Could not connect to server
 Local networkを許可した今回の試行では、前節のコマンド起動エラーは発生しませんでした。ただし、**OutboundとLocal networkの両方を許可しても、今回の検証では外部通信の成功を確認できませんでした。**
 
 この結果だけでは接続失敗の原因は特定できません。サンドボックス外での同じコマンドの実行結果との比較など、追加の切り分けが必要です。
+
+### 9.5 3回の試行で確認できたこと
+
+| 試行 | ネットワーク設定 | コマンドの起動 | 結果 |
+|---|---|---|---|
+| 外向き通信を拒否 | Outboundを拒否 | 成功 | 名前解決に失敗、curl終了コード6 |
+| 外向き通信を許可 | Outboundを許可、Local networkを拒否 | 失敗 | `GenericFailure`、curl終了コードは取得不可 |
+| ローカル通信も許可 | OutboundとLocal networkを許可 | 成功 | 外部サーバーへの接続に失敗、curl終了コード7 |
+
+Local networkを許可した試行ではコマンドを起動できましたが、外部通信の成功は確認できていません。したがって、Copilot CLIについては「拒否時と許可時で通信の成否が切り替わることを検証できた」とは結論できません。5節のMXC単体の試験はホストのループバック宛てであり、今回の外部サイト宛ての結果とは検証対象も異なります。
+
+また、今回指定した `--noproxy "*"` は、curlがプロキシを使わずに直接接続する指定です。プロキシが必要なネットワークでは、通信を許可してもこの条件では接続に失敗する可能性があります。Windowsのホスト別ルールはプログラムがプロキシ設定に従うことを前提としているため、この試験でホスト別ルールの適用を確認することもできません。
+
+追加検証では、直接接続とプロキシ経由の接続を分け、変更前後の実効ポリシー、Shellの起動可否、curlの終了コード、HTTP応答の有無を記録する必要があります。サンドボックス外との比較を行う場合は、今回の「サンドボックス外で再実行しない」という条件から切り離した別の試験として実施します。
 
 参考：[GitHub Copilotのローカルサンドボックス設定](https://docs.github.com/ja/copilot/how-tos/cloud-and-local-sandboxes/configuring-local-sandbox-settings)
 
