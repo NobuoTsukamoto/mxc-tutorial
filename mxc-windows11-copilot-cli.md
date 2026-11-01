@@ -808,133 +808,135 @@ Copilot CLIでは、作業ディレクトリ `C:\Users\<ユーザー名>\Project
 
 ## 9. Copilot CLIでネットワーク制御を試す
 
-最後に、Copilot CLIのネットワークアクセスを検証しました。
+サンドボックス内から外部サイトへ直接HTTPS接続し、Outboundの許可・拒否によって結果がどう変わるかを確認しました。接続先には `https://example.com` を使い、Local networkの設定も記録しました。
 
-検証では、サンドボックスを有効にし、8.3節で設定した `Allow sandbox bypass: no` を維持しました。Shellツールによるコマンドの実行結果を確認し、Web検索やサンドボックス外での再実行は使わない条件です。
+### 9.1 試験条件とログの保存
 
-### 9.1 Outboundを拒否する
+サンドボックスやネットワークの設定は、ユーザーが `/sandbox config` で変更します。Copilotには設定変更を依頼せず、Shellツールで試験コマンドを実行させます。設定変更後は `/sandbox status` と `/sandbox policy` で状態と実効ポリシーを確認し、結果とともに保存します。サンドボックス有効時は、8.3節で設定した `Allow sandbox bypass: no` を維持しました。
 
-`/sandbox config` のNetworkタブで外向き通信を拒否し、Copilotに次のように指示しました。
+認証機能に伴うローカルプロキシの影響を除くため、CredentialsのGit・`gh`認証を両方オフにしました。Networkの `Proxy and blocking` では、Remote proxyを未設定、Host rulesを空にしています。この条件を維持し、OutboundとLocal networkだけを変更します。
 
-> ローカルサンドボックスのネットワーク制御を検証します。Shellツールで `curl.exe --noproxy "*" -I --max-time 5 https://example.com` を1回だけ実行してください。終了コードと標準エラー出力を報告してください。Web検索ツールは使わず、サンドボックス外での再実行やバイパスもしないでください。
-
-Shellツールが実行したPowerShellコマンドは次のとおりです。
+基本の試験コマンドは次のとおりです。`--noproxy "*"` はプロキシを使わない直接接続、`-v` は接続先や失敗した段階の記録、`-I` はHEADリクエストの指定です。
 
 ```powershell
-curl.exe --noproxy "*" -I --max-time 5 https://example.com; Write-Output "EXIT_CODE=$LASTEXITCODE"
+curl.exe --noproxy "*" -v -I --max-time 5 https://example.com
 ```
 
-結果：
+各条件で1回だけ実行させるには、次のように依頼します。条件ごとにコマンドだけを変更し、失敗時の追加実行は行わない手順です。
 
 ```text
-curl: (6) Could not resolve host: example.com
-EXIT_CODE=6
+Shellツールで次のコマンドを1回だけ実行し、標準エラー出力をファイルに保存してください。
+
+curl.exe --noproxy "*" -v -I --max-time 5 https://example.com
+
+実行したPowerShellコードの全文、終了コード、標準エラー出力の全文、
+標準エラー出力ファイルのパスを、省略せず報告してください。
+Web検索ツールは使わず、失敗時の再実行や追加の設定変更もしないでください。
+サンドボックス外での実行やバイパスはせず、現在のサンドボックス内で実行してください。
 ```
 
-Shellツールは `sandboxed` と表示され、curlは名前解決エラーを返しました。終了コードは6で、HTTP応答は取得できませんでした。ただし、この結果だけでは、名前解決の失敗がサンドボックスの制限によるものか、DNSや接続環境によるものかまでは判断できません。許可時の結果と比較する必要があります。
+Shellツールが実行したPowerShellコードは次のとおりです。curlを `cmd.exe` から呼び出し、標準エラー出力を一時ファイルに保存してから全文を読み出しています。
 
-### 9.2 Outboundを許可する
-
-次に、`/sandbox config` でOutboundを許可し、Local networkは拒否したままにしました。設定変更後はセッションを再起動し、サンドボックスの状態と実効ポリシーを確認する手順で進めます。
-
-```text
-/restart-session
-/sandbox status
-/sandbox policy
+```powershell
+$stderrFile = Join-Path $env:TEMP ('curl-stderr-' + [guid]::NewGuid().ToString() + '.txt')
+& $env:ComSpec /d /c ('curl.exe --noproxy "*" -v -I --max-time 5 https://example.com 2> "' + $stderrFile + '"')
+$exitCode = $LASTEXITCODE
+Write-Output "EXIT_CODE=$exitCode"
+Write-Output "STDERR_FILE=$stderrFile"
+Write-Output 'STDERR_BEGIN'
+Get-Content -Raw -LiteralPath $stderrFile
+Write-Output 'STDERR_END'
 ```
 
-比較時に確認したポリシーは次のとおりです。
+以降のログは、保存した全文から接続の成否を判断する箇所を抜粋しています。
 
-```text
+### 9.2 Outboundの許可・拒否と接続結果
+
+Git・`gh`認証を両方オフにした状態で、ネットワーク設定を次の3通りに変更しました。
+
+| Outbound | Local network | 直接接続コマンドの結果 |
+|---|---|---|
+| 許可 | 許可 | 終了コード0、IPv6で接続しHTTP `200 OK` |
+| 許可 | 拒否 | 終了コード0、IPv6で接続しHTTP `200 OK` |
+| 拒否 | 拒否 | 終了コード6、名前解決失敗 |
+
+Local networkだけを拒否しても、外部サイトへの直接HTTPS接続は成功しました。`example.com` は外部インターネット上のホストであり、この条件ではLocal networkの許可を必要としませんでした。なお、この試験は外部サイト宛てのため、ローカルネットワークへの通信が実際に拒否されるかは検証していません。
+
+続いてOutboundも拒否した際の実効ポリシーとエラーは、次のとおりです。
+
+```yaml
 Network:
-  Outbound: allowed
+  Outbound: blocked
   Local network: blocked
 
 Capabilities:
   Allow sandbox bypass: no
+  Authenticate git (sandbox setting): off
+  Authenticate gh (sandbox setting): off
+  Denial capture: off
 ```
-
-接続先とオプションを維持し、待ち時間を `--max-time 10` に変更して再検証を依頼したところ、Shellツールは次のエラーを返しました。
 
 ```text
-GenericFailure
-
-Cannot start sandboxed command:
-Sandboxed commands cannot reach the loc...
+curl: (6) Could not resolve host: example.com
 ```
 
-今回は、サンドボックス内のコマンド自体を起動できませんでした。
+この比較では、Outboundを許可した条件でHTTP応答を取得でき、拒否した条件で名前解決に失敗しました。ただし、名前解決の失敗だけでは、IPアドレスを指定した接続も拒否されるかは分かりません。そこで、次に接続先のIPv4アドレスを固定しました。
 
-エラーはCopilot CLIのサンドボックス付きコマンドの起動処理で発生しています。curlは実行されていないため、curlの終了コード、HTTPステータス、標準エラー出力は取得できません。表示された `GenericFailure` は、curlの終了コード6とは区別して扱います。ログだけでは、起動処理のどの内部コンポーネントが拒否したかまでは特定できません。
+### 9.3 名前解決を省いたIPv4接続の確認
 
-### 9.3 なぜLocal networkが関係するのか
-
-GitHub公式ドキュメントによると、Windows版Copilot CLIでは、ホスト別ネットワークルールやプロキシ機能、認証情報の保護にローカルプロキシが利用されます。
-
-Windowsでこれらのプロキシ機能を使うには、対応するOSに加えて `Allow local network` の有効化が必要です。Gitや `gh` の認証情報のマスキングも、リモートプロキシやホスト別ルールを設定していなくてもローカルプロキシを使います。
-
-今回の環境では、次の機能も有効でした。
-
-```text
-Authenticate git (sandbox setting): on
-Authenticate gh (sandbox setting): on
-```
-
-今回の起動エラーは、ローカルネットワークを禁止した状態で、Copilot CLIが必要とするローカルサービスへの接続条件を満たせなかった可能性があります。
-
-そのため、当初の「Outboundだけを許可し、Local networkは拒否のままにする」という案内は、この環境で使われるローカルプロキシの条件を考慮できていませんでした。切り分けとして、次はOutboundを許可したままLocal networkも許可します。この変更はプライベートネットワークへのアクセスも許可するため、ローカルプロキシだけに限定した例外設定ではありません。
-
-ただし、ログが途中で省略されているため、具体的にどのローカルサービスが原因だったかは確定していません。
-
-なお、`https://example.com` 自体は外部インターネット上のホストであり、ローカルネットワークのアドレスではありません。
-
-### 9.4 ネットワーク許可時の最終検証
-
-`/sandbox config` でLocal networkを許可し、セッションを再起動してから、サンドボックスの状態と実効ポリシーを確認します。原稿に記録されている追加検証では、以下の設定でサンドボックスのバイパスを無効にした状態を確認しました。
-
-```yaml
-Network:
-  Outbound: allowed
-  Local network: allowed
-
-Capabilities:
-  Allow sandbox bypass: no
-```
-
-実行したコマンドは以下です。
+OutboundとLocal networkを両方拒否し、両認証をオフにした状態で、次のコマンドを1回実行しました。`--resolve` は接続先IPアドレスを指定しつつ、TLSとHTTPで使うホスト名を `example.com` に保つ指定です。
 
 ```powershell
-curl.exe --noproxy "*" -I --max-time 10 https://example.com
+curl.exe --noproxy "*" --resolve "example.com:443:104.20.23.154" -v -I --max-time 5 https://example.com
 ```
 
-実行結果：
+ログでは、指定したアドレスが使われ、TCP接続が `Bad access` で失敗しました。終了コードは7でした。
 
 ```text
-curl: (7) Failed to connect to example.com:443
-after 49 ms: Could not connect to server
+Hostname example.com was found in DNS cache
+IPv4: 104.20.23.154
+Trying 104.20.23.154:443...
+connect to 104.20.23.154 port 443 from 0.0.0.0 port 59162 failed: Bad access
+curl: (7) Failed to connect to example.com:443 after 1 ms: Could not connect to server
 ```
 
-コマンドはサンドボックス内で実行できましたが、外部サーバーへの接続に失敗し、終了コード7で終了しました。
+これにより、両ネットワーク拒否時には、名前解決を省いても指定した外部IPv4への接続が失敗することを確認しました。ただし、同じIPv4を固定したコマンドをOutbound許可に戻して実行する比較は、まだ完了していません。許可時に成功したのはIPv6接続のため、同一IPv4宛ての成否がOutboundだけで切り替わるとまでは断定しません。
 
-Local networkを許可した今回の試行では、前節のコマンド起動エラーは発生しませんでした。ただし、OutboundとLocal networkの両方を許可した状態でも、外部通信の成功は確認できていません。
+### 9.4 認証設定とローカルプロキシ経由の接続
 
-この結果だけでは接続失敗の原因は特定できません。サンドボックス外での同じコマンドの実行結果との比較など、追加の切り分けが必要です。
+Git・`gh`認証を利用する場合は、資格情報の保護に伴うローカルプロキシも考慮する必要があります。ここではサンドボックスを有効にし、OutboundとLocal networkを両方許可した条件で、認証設定と接続方法による違いを確認しました。Remote proxyは未設定、Host rulesは空、`Allow sandbox bypass: no` を維持しました。
 
-### 9.5 3回の試行で確認できたこと
+ユーザーがCredentialsでGit・`gh`認証を両方オンまたは両方オフに切り替え、Shellツールで次のコマンドを実行しました。直接接続には9.1節の `--noproxy "*"` 付きコマンドを使い、プロキシ経由の確認ではこのオプションだけを外しました。ログの保存方法は9.1節と同じです。
 
-| 試行 | ネットワーク設定 | コマンドの起動 | 結果 |
-|---|---|---|---|
-| 外向き通信を拒否 | Outboundを拒否 | 成功 | 名前解決に失敗、curl終了コード6 |
-| 外向き通信を許可 | Outboundを許可、Local networkを拒否 | 失敗 | `GenericFailure`、curl終了コードは取得不可 |
-| ローカル通信も許可 | OutboundとLocal networkを許可 | 成功 | 外部サーバーへの接続に失敗、curl終了コード7 |
+```powershell
+curl.exe -v -I --max-time 5 https://example.com
+```
 
-Local networkを許可した試行ではコマンドを起動できましたが、外部通信の成功は確認できていません。したがって、Copilot CLIについては「拒否時と許可時で通信の成否が切り替わることを検証できた」とは結論できません。5節のMXC単体の試験はホストのループバック宛てであり、今回の外部サイト宛ての結果とは検証対象も異なります。
+| Git・`gh`認証 | 接続方法 | 結果 |
+|---|---|---|
+| 両方オフ | `--noproxy "*"` による直接接続 | 終了コード0、HTTP `200 OK` |
+| 両方オン | `--noproxy "*"` による直接接続 | 終了コード7、IPv4・IPv6ともに `Bad access` |
+| 両方オン | 環境変数で指定されたローカルプロキシ経由 | 終了コード0、HTTP `200 OK` |
 
-また、今回指定した `--noproxy "*"` は、curlがプロキシを使わずに直接接続する指定です。プロキシが必要なネットワークでは、通信を許可してもこの条件では接続に失敗する可能性があります。Windowsのホスト別ルールはプログラムがプロキシ設定に従うことを前提としているため、この試験でホスト別ルールの適用を確認することもできません。
+両認証がオンの状態で `--noproxy` を外すと、curlは `https_proxy` に設定されたループバックアドレスへ接続しました。次の抜粋では、プロキシへの接続、CONNECTトンネルの確立、外部サイトからのHTTP応答を確認できます。ポート番号は、この実行時の値です。
 
-追加検証では、直接接続とプロキシ経由の接続を分け、変更前後の実効ポリシー、Shellの起動可否、curlの終了コード、HTTP応答の有無を記録する必要があります。サンドボックス外との比較を行う場合は、今回の「サンドボックス外で再実行しない」という条件から切り離した別の試験として実施します。
+```text
+* Uses proxy env variable https_proxy == 'http://127.0.0.1:61952'
+*   Trying 127.0.0.1:61952...
+> CONNECT example.com:443 HTTP/1.1
+* CONNECT tunnel established, response 200
+> HEAD / HTTP/1.1
+> Host: example.com
+< HTTP/1.1 200 OK
+```
 
-参考：[GitHub Copilotのローカルサンドボックス設定](https://docs.github.com/ja/copilot/how-tos/cloud-and-local-sandboxes/configuring-local-sandbox-settings)
+[GitHubの公式説明](https://docs.github.com/en/copilot/how-tos/cloud-and-local-sandboxes/configuring-local-sandbox-settings)では、Git・`gh`認証の資格情報マスキングは、Remote proxyやHost rulesを設定していなくてもローカルプロキシを使用するとされています。今回の結果も、この説明と整合します。Certificate authorityは未インストールのままで、今回のcurlによるTLS通信は成功しました。
+
+この環境では、両認証オン時の直接接続は失敗し、プロキシ経由の接続は成功しました。ローカルプロキシ自体の有効・無効を操作した試験ではなく、認証設定と接続方法を比較した結果です。Gitと `gh` の認証を個別に切り替えた場合や、直接接続を拒否する内部制御までは確認していません。
+
+### 9.5 検証対象の範囲
+
+外部サイトへの直接接続と認証プロキシ経由の接続を確認しました。ローカルネットワーク宛ての通信の許可・拒否や、ホスト別ルールの動作は検証していません。認証機能をオンにしてLocal networkを拒否した場合も、9.4節の比較には含めていません。5節のMXC単体の試験はホストのループバック宛てであり、外部サイトを使った本節とは接続先が異なります。
 
 ## 10. MXC単体とCopilot CLIの比較
 
@@ -946,8 +948,8 @@ MXC単体とCopilot CLIについて、確認できた動作とポリシー管理
 | 読み取り専用制御 | 成功 | 成功 |
 | 書き込み許可 | 成功 | 作業ディレクトリへの許可設定を確認 |
 | アクセス拒否 | 成功 | 成功 |
-| ネットワーク拒否 | 成功 | 外部通信失敗を確認 |
-| ネットワーク許可 | ループバック通信で成功 | コマンド起動は成功、外部接続は失敗（curl終了コード7） |
+| ネットワーク拒否 | 成功 | 両認証オフで名前解決失敗と固定IPv4への接続失敗を確認 |
+| ネットワーク許可 | ループバック通信で成功 | 両認証オフの直接接続と、両認証オンのプロキシ経由で外部HTTPS通信に成功 |
 | ポリシー管理 | SDKのコード | `/sandbox config` |
 | 実効ポリシー確認 | SDK設定・実行結果 | `/sandbox policy` |
 | バイパス制御 | 呼び出し側で設計 | Copilot CLIが機能を提供 |
@@ -995,7 +997,7 @@ MXCで実行時のアクセスを制限しても、許可した範囲内での�
 
 MXCのSDKでは、コマンドの実行時にアクセス制限を指定できます。利用できる制御機能はWindowsのビルドや分離バックエンドによって異なるため、使用する環境での動作確認が必要です。Copilot CLIを使う場合は、アクセス制限に加え、承認によって制限を緩和できる条件も確認する必要があります。
 
-今後は、Copilot CLIでネットワークを許可しても外部接続に失敗した原因の切り分けに加え、MCPサーバーやLSPサーバーに対する隔離、認証情報の取り扱いなども確認していきたいと考えています。
+Copilot CLIでは、両認証オフの直接接続で外部HTTPS通信に成功し、Outbound拒否時の名前解決失敗と固定IPv4への接続失敗も確認しました。今後は、同一IPv4宛ての許可・拒否の比較や、MCPサーバーとLSPサーバーに対する隔離、認証情報の取り扱いなどを確認していきたいと考えています。
 
 ---
 
@@ -1016,4 +1018,4 @@ WindowsのコマンドがCP932などで出力した文字列と、SDKによるUT
 5. [GitHub Copilot — ローカルサンドボックスの構成](https://docs.github.com/ja/copilot/how-tos/cloud-and-local-sandboxes/configuring-local-sandbox-settings)
 6. [GitHub Copilot — Using local sandboxing](https://docs.github.com/en/copilot/how-tos/cloud-and-local-sandboxes/using-local-sandboxing)
 
-*検証日：2026年10月12日〜28日*
+*検証日：2026年10月12日〜30日（ネットワーク接続確認を含む）*
